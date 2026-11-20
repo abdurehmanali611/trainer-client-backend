@@ -31,21 +31,105 @@ def trainer_platform_blocked(client: Client) -> bool:
     return False
 
 
+def evaluate_client(client: Client, today: date | None = None):
+    """Run the shared payment-timing rules (payment_engine.py) for a client."""
+    from apps.billing.models import Payment
+
+    from . import payment_engine as pe
+
+    today = today or date.today()
+    inst = client.payment_instruction
+    rule = None
+    if inst is not None:
+        rule = pe.InstructionRule(
+            billing_cycle=inst.billing_cycle,
+            cycle_from=inst.cycle_from,
+            cycle_to=inst.cycle_to,
+            is_prepayment=inst.is_prepayment,
+            start_ask_days=inst.start_ask_days or 0,
+            grace_days=inst.grace_days or 0,
+            amount=float(inst.amount) if inst.amount is not None else None,
+        )
+    periods = [
+        pe.PeriodRow(p.id, p.start_date, p.end_date, float(p.amount or 0), bool(p.is_trial))
+        for p in client.periods.all()
+    ]
+    invoices = [
+        pe.InvoiceRow(i.id, i.period_id, i.due_date, i.status, float(i.amount or 0))
+        for i in client.invoices.all()
+    ]
+    pending = set(
+        Payment.objects.filter(client=client, status="pending").values_list("invoice_id", flat=True)
+    )
+    return pe.evaluate(
+        today,
+        mode=client.mode,
+        is_active=client.is_active,
+        created_on=client.created_at.date(),
+        instruction=rule,
+        periods=periods,
+        invoices=invoices,
+        pending_invoice_ids=pending,
+    )
+
+
+def ensure_due_invoice(client: Client, ev) -> int | None:
+    """The invoice the client pays against right now (created on first need).
+
+    A client is asked for one payment at a time. When the ask window opens
+    there is no invoice yet, so make exactly one — keyed by the period (a
+    post-paid discount) or by the first day of the cycle being paid for, so
+    repeated reads never create a second.
+    """
+    from apps.billing.models import Invoice
+
+    if not ev.required:
+        return ev.invoice_id
+    if ev.invoice_id:
+        return ev.invoice_id
+    if ev.pay_period_id:
+        existing = Invoice.objects.filter(client=client, period_id=ev.pay_period_id).first()
+        if existing:
+            return existing.id
+        return Invoice.objects.create(
+            client=client,
+            period_id=ev.pay_period_id,
+            amount=ev.amount or 0,
+            due_date=ev.cycle_start,
+            status="pending",
+        ).id
+    if ev.pay_start is None or ev.pay_end is None:
+        return None
+    existing = (
+        Invoice.objects.filter(
+            client=client,
+            period__isnull=True,
+            due_date__gte=ev.pay_start,
+            due_date__lte=ev.pay_end,
+        )
+        .exclude(status__in=("paid", "forgiven"))
+        .first()
+    )
+    if existing:
+        return existing.id
+    return Invoice.objects.create(
+        client=client,
+        period=None,
+        amount=ev.amount or 0,
+        due_date=ev.pay_start,
+        status="pending",
+    ).id
+
+
 def client_access_state(client: Client) -> dict:
     """
-    Decide whether a client can use the app.
+    Decide whether a client can use the app (rules: payment_engine.py).
 
     Returns one of:
-      {state: "allowed", ...}
-      {state: "blocked_unpaid", invoice: ...}   — expired period with unpaid invoice
-      {state: "blocked_no_period"}              — no period covers today (contact trainer)
-      {state: "blocked_trial_expired", ...}     — trial over, no paid period
-      {state: "blocked_trainer_platform"}       — trainer apex quarterly unpaid (Feature 16)
+      {state: "allowed", reason: ...}
+      {state: "blocked_unpaid", invoice_id, period_id}   — asked, grace over, unpaid
+      {state: "blocked_trainer_platform"}                — trainer's Apex fee unpaid (Feature 16)
     """
-    from datetime import datetime  # noqa: F401  (kept for parity with trainer backend)
-
-    today = date.today()
-
     if client.mode == "illustrative" or not client.is_active:
         return {"state": "allowed", "reason": "illustrative" if client.mode == "illustrative" else "inactive"}
 
@@ -56,56 +140,32 @@ def client_access_state(client: Client) -> dict:
             "reason": "Your trainer's subscription with the platform is paused. Try again once they restore access.",
         }
 
-    period = (
-        client.periods.filter(start_date__lte=today, end_date__gte=today)
-        .order_by("-end_date")
-        .first()
-    )
-    if period:
-        if period.is_trial:
-            return {"state": "allowed", "reason": "trial", "period_id": period.id}
-        invoice = period.invoices.order_by("-created_at").first()
-        if invoice is None:
-            return {"state": "allowed", "reason": "no_invoice", "period_id": period.id}
-        if invoice.status in ("paid", "forgiven"):
-            return {"state": "allowed", "reason": "paid", "period_id": period.id}
-        # Still inside the pay window (start..end) — allowed while they pay
-        if today <= period.end_date:
-            return {
-                "state": "allowed",
-                "reason": "pay_window",
-                "period_id": period.id,
-                "invoice_id": invoice.id,
-            }
-        return {
-            "state": "blocked_unpaid",
-            "invoice_id": invoice.id,
-            "period_id": period.id,
-        }
-
-    # Grace window — the payment instruction can keep the app open for a few
-    # days after the final day of the subscription before blocking.
-    grace = 0
-    if client.payment_instruction_id:
-        grace = client.payment_instruction.grace_days or 0
-    last_period = client.periods.order_by("-end_date").first()
-    if grace and last_period:
-        from datetime import timedelta
-
-        if today <= last_period.end_date + timedelta(days=grace):
-            return {
-                "state": "allowed",
-                "reason": "grace",
-                "period_id": last_period.id,
-            }
-
-    # No period covers today
-    unpaid = (
-        client.invoices.filter(status__in=("pending", "overdue")).order_by("-due_date").first()
-    )
-    if unpaid:
-        return {"state": "blocked_unpaid", "invoice_id": unpaid.id}
-    return {"state": "blocked_no_period"}
+    ev = evaluate_client(client)
+    if ev.needs_setup:
+        return {"state": "allowed", "reason": "needs_setup"}
+    if ev.kind == "trial" and not ev.required:
+        return {"state": "allowed", "reason": "trial", "period_id": ev.active_period_id}
+    # (a prepaid client's first paid month is asked near the END of the trial,
+    # so a trial can reach the ask / grace / blocked phases too)
+    if ev.blocked:
+        out = {"state": "blocked_unpaid", "reason": "unpaid"}
+        invoice_id = ensure_due_invoice(client, ev)
+        if invoice_id:
+            out["invoice_id"] = invoice_id
+        if ev.active_period_id:
+            out["period_id"] = ev.active_period_id
+        return out
+    reason = {"ask": "pay_window", "grace": "grace"}.get(ev.phase, "paid" if ev.phase == "covered" else ev.phase)
+    out = {"state": "allowed", "reason": reason}
+    if ev.required:
+        invoice_id = ensure_due_invoice(client, ev)
+        if invoice_id:
+            out["invoice_id"] = invoice_id
+    elif ev.invoice_id:
+        out["invoice_id"] = ev.invoice_id
+    if ev.active_period_id:
+        out["period_id"] = ev.active_period_id
+    return out
 
 
 def payment_instruction_payload(trainer) -> dict:
@@ -119,98 +179,49 @@ def payment_instruction_payload(trainer) -> dict:
 
 
 def payment_requirement(client: Client) -> dict:
-    """Feature 10: what, if anything, the client must pay RIGHT NOW.
+    """What, if anything, the client must pay right now (rules: payment_engine.py).
 
-    Resolves from the ACTIVE period config (the same row edit/delete operate
-    on), evaluated on every read — so a config edit or delete changes the
-    answer immediately, with no cache and no re-login:
+    trial period running      -> nothing to pay, nothing asked
+    discount period running   -> pay the reduced amount of that period
+    otherwise                 -> the payment instruction's cycle, asked from
+                                 `start_ask_days` before the due day, kept open
+                                 `grace_days` after it, then blocked
+    illustration/deactivated  -> never asked
 
-      trial period (config ON) -> nothing to pay during that period
-      paid config (discount)   -> pay the configured amount
-      no config for today      -> the creation-time payment instruction
-                                   (Client.payment_instruction, the default)
-
-    Feature 11: the fallback to the instruction happens the moment the
-    period's end date passes — the boundary is re-evaluated on every read
-    (no cron, no scheduled job, so there is no gap where the old config
-    still applies). `days_left` exposes that boundary for the warning state.
-
-    Returns {required, amount, source, period_id, instruction_id, days_left}.
+    Kept in parity with the trainer backend's copy (apps/fitness/services.py).
     """
-    today = date.today()
-
-    # Illustrative / deactivated clients are never asked for money.
     if client.mode == "illustrative" or not client.is_active:
         return {
             "required": False,
             "amount": None,
-            "source": "illustrative",
+            "source": "illustrative" if client.mode == "illustrative" else "inactive",
             "period_id": None,
             "instruction_id": None,
+            "phase": "none",
         }
-
-    period = (
-        client.periods.filter(start_date__lte=today, end_date__gte=today)
-        .order_by("-end_date")
-        .first()
-    )
-
-    if period:
-        # Days until the config's final day (0 on the last day itself). This is
-        # the boundary the warning state flips on — feature 13 renders it.
-        days_left = (period.end_date - today).days
-        # Trial ON -> the client is not asked for payment in this period.
-        if period.is_trial:
-            return {
-                "required": False,
-                "amount": None,
-                "source": "trial",
-                "period_id": period.id,
-                "instruction_id": None,
-                "days_left": days_left,
-            }
-        invoice = period.invoices.order_by("-created_at").first()
-        if invoice is not None and invoice.status in ("paid", "forgiven"):
-            # Already settled for this period.
-            return {
-                "required": False,
-                "amount": None,
-                "source": "paid",
-                "period_id": period.id,
-                "instruction_id": None,
-                "days_left": days_left,
-            }
-        # Paid config -> the configured amount is the ask (discount included).
-        return {
-            "required": True,
-            "amount": str(period.amount),
-            "source": "period",
-            "period_id": period.id,
-            "instruction_id": None,
-            "days_left": days_left,
-        }
-
-    # Feature 11: no config covers today (the period's end date has passed)
-    # -> the creation-time instruction takes over automatically, on read.
-    # There is no cron and no scheduled job: the boundary is evaluated every
-    # time this runs, so no gap is possible.
-    instruction = client.payment_instruction
-    if instruction is None:
-        return {
-            "required": False,
-            "amount": None,
-            "source": "no_instruction",
-            "period_id": None,
-            "instruction_id": None,
-            "days_left": None,
-        }
+    ev = evaluate_client(client)
     return {
-        "required": True,
-        "amount": str(instruction.amount) if instruction.amount is not None else None,
-        "source": "instruction",
-        "period_id": None,
-        "instruction_id": instruction.id,
-        "days_left": None,
+        "required": ev.required,
+        "amount": (str(ev.amount) if ev.amount is not None else None)
+        if (ev.required or ev.kind in ("paid", "discount"))
+        else None,
+        "source": ev.source,
+        "period_id": ev.active_period_id,
+        "instruction_id": client.payment_instruction_id
+        if (ev.kind == "paid" or (ev.required and ev.pay_period_id is None))
+        else None,
+        "days_left": ev.days_left,
+        "phase": ev.phase,
+        "kind": ev.kind,
+        "cycle_start": ev.cycle_start.isoformat() if ev.cycle_start else None,
+        "cycle_end": ev.cycle_end.isoformat() if ev.cycle_end else None,
+        "due_on": ev.due_on.isoformat() if ev.due_on else None,
+        "ask_opens_on": ev.ask_opens_on.isoformat() if ev.ask_opens_on else None,
+        "blocked_from": ev.blocked_from.isoformat() if ev.blocked_from else None,
+        "grace_ends_on": ev.grace_ends_on.isoformat() if ev.grace_ends_on else None,
+        "next_due_on": ev.next_due_on.isoformat() if ev.next_due_on else None,
+        "next_ask_opens_on": ev.next_ask_opens_on.isoformat() if ev.next_ask_opens_on else None,
+        "awaiting_approval": ev.awaiting_approval,
     }
 
 
