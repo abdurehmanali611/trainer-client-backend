@@ -73,6 +73,18 @@ def evaluate_client(client: Client, today: date | None = None):
     )
 
 
+def _sync_invoice_amount(invoice_id: int, ev) -> None:
+    """An unpaid, plain (not period-linked) invoice always asks the payment
+    instruction's amount, even if it was created or edited with another value."""
+    from apps.billing.models import Invoice
+
+    if ev.pay_period_id or not ev.amount:
+        return
+    Invoice.objects.filter(
+        pk=invoice_id, period__isnull=True, status__in=("pending", "overdue")
+    ).exclude(amount=ev.amount).update(amount=ev.amount)
+
+
 def ensure_due_invoice(client: Client, ev) -> int | None:
     """The invoice the client pays against right now (created on first need).
 
@@ -86,6 +98,7 @@ def ensure_due_invoice(client: Client, ev) -> int | None:
     if not ev.required:
         return ev.invoice_id
     if ev.invoice_id:
+        _sync_invoice_amount(ev.invoice_id, ev)
         return ev.invoice_id
     if ev.pay_period_id:
         existing = Invoice.objects.filter(client=client, period_id=ev.pay_period_id).first()
@@ -111,6 +124,7 @@ def ensure_due_invoice(client: Client, ev) -> int | None:
         .first()
     )
     if existing:
+        _sync_invoice_amount(existing.id, ev)
         return existing.id
     return Invoice.objects.create(
         client=client,
